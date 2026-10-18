@@ -2482,15 +2482,21 @@ function sheetHTML(C){const P=sheetParts(C);return `<div class="sh"><section cla
 const A4X=96/25.4,A4W=Math.round(210*A4X),A4H=Math.round(297*A4X),A4M=Math.round(8*A4X),A4CW=A4W-2*A4M,A4CH=A4H-2*A4M;
 const u8b64=u=>{let s='';for(let i=0;i<u.length;i+=8192) s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(s)};
 const b64u8=s=>{const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++) u[i]=b.charCodeAt(i);return u};
-async function pageJPEG(html,scale){
+async function loadImg(src){const img=new Image();await new Promise((ok,no)=>{img.onload=ok;img.onerror=()=>no(new Error('не удалось отрисовать страницу'));img.src=src;});return img;}
+async function pageJPEG(html,scale,overlays){
  const box=document.createElement('div');box.innerHTML=html;
  const x=new XMLSerializer().serializeToString(box),css=SHEET_CSS.replace(/&/g,'&amp;').replace(/</g,'&lt;');
  const Wd=Math.round(A4W*scale),Hd=Math.round(A4H*scale);
  const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${Wd}" height="${Hd}" viewBox="0 0 ${A4W} ${A4H}"><foreignObject x="0" y="0" width="${A4W}" height="${A4H}"><div xmlns="http://www.w3.org/1999/xhtml" style="width:${A4W}px;height:${A4H}px;padding:${A4M}px;box-sizing:border-box;background:#fff;overflow:hidden"><style>${css}</style>${x}</div></foreignObject></svg>`;
- const img=new Image();
- await new Promise((ok,no)=>{img.onload=ok;img.onerror=()=>no(new Error('не удалось отрисовать страницу'));img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);});
+ const img=await loadImg('data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg));
  const cv=document.createElement('canvas');cv.width=Wd;cv.height=Hd;const g=cv.getContext('2d');
  g.fillStyle='#fff';g.fillRect(0,0,Wd,Hd);g.drawImage(img,0,0,Wd,Hd);
+ // Картинки поверх: Safari не всегда рисует <img> внутри SVG
+ for(const o of overlays||[]){try{const im=await loadImg(o.src),k=Wd/A4W,b=1.3,r=6.2;
+  const X=(o.x+b)*k,Y=(o.y+b)*k,Wb=(o.w-2*b)*k,Hb=(o.h-2*b)*k,ar=Wb/Hb,iar=im.naturalWidth/im.naturalHeight;
+  let sx=0,sy=0,sw=im.naturalWidth,sh=im.naturalHeight;
+  if(iar>ar){sw=sh*ar;sx=(im.naturalWidth-sw)/2;} else {sh=sw/ar;sy=(im.naturalHeight-sh)*o.py;}
+  g.save();g.beginPath();if(g.roundRect) g.roundRect(X,Y,Wb,Hb,r*k); else g.rect(X,Y,Wb,Hb);g.clip();g.drawImage(im,sx,sy,sw,sh,X,Y,Wb,Hb);g.restore();}catch(e){}}
  return {jpeg:b64u8(cv.toDataURL('image/jpeg',0.9).split(',')[1]),w:Wd,h:Hd};
 }
 function buildPdf(pages,state){
@@ -2512,25 +2518,48 @@ function buildPdf(pages,state){
  push(`trailer\n<< /Size ${n} /Root 1 0 R /Info << /Title (D&D 2024 character sheet) /Producer (dnd2024 builder) >> >>\nstartxref\n${xref}\n%%EOF\n`);
  const out=new Uint8Array(len);let o=0;for(const b of parts){out.set(b,o);o+=b.length;}return out;
 }
+// Раскладка по колоночным блокам вручную: CSS-колонки внутри SVG в Safari рисуются без масштаба
+function measureBlocks(cls,cw,body){
+ const m=document.createElement('div');m.style.cssText=`position:absolute;left:-30000px;top:0;width:${A4CW}px;visibility:hidden`;
+ m.innerHTML=`<div class="sh" style="width:${A4CW}px;margin:0"><div class="${cls}" style="width:${cw}px;columns:auto">${body}</div></div>`;
+ document.body.appendChild(m);const out=[];
+ for(const el of m.firstChild.firstChild.children){const cs=getComputedStyle(el);
+  out.push({html:el.outerHTML,h:el.getBoundingClientRect().height+parseFloat(cs.marginTop||0)+parseFloat(cs.marginBottom||0),head:el.tagName==='H3'||el.classList.contains('lv')});}
+ m.remove();return out;
+}
+function packColumns(blocks,cap){
+ const cols=[];let cur=[],h=0;
+ blocks.forEach((b,i)=>{const need=b.head&&blocks[i+1]?b.h+blocks[i+1].h:b.h;
+  if(cur.length&&h+need>cap+0.5){cols.push({items:cur,h});cur=[];h=0;}
+  cur.push(b.html);h+=b.h;});
+ if(cur.length) cols.push({items:cur,h});
+ return cols;
+}
 async function makePDF(C){
- const P=sheetParts(C),pages=[];
- const m=document.createElement('div');m.style.cssText=`position:absolute;left:-30000px;top:0;width:${A4CW}px;visibility:hidden`;document.body.appendChild(m);
+ const P=sheetParts(C),pages=[],gap=19;
  const shw=inner=>`<div class="sh" style="width:${A4CW}px;margin:0">${inner}</div>`;
+ const m=document.createElement('div');m.style.cssText=`position:absolute;left:-30000px;top:0;width:${A4CW}px;visibility:hidden`;document.body.appendChild(m);
+ const hOf=html=>{m.innerHTML=shw(html);return m.firstChild.offsetHeight;};
+ let ov=[];
  try{
-  m.innerHTML=shw(P.p1);const h1=m.firstChild.offsetHeight;
-  pages.push(h1>A4CH?`<div style="zoom:${(A4CH/h1).toFixed(4)}">${shw(P.p1)}</div>`:shw(P.p1));
-  const flow=(title,body,cols,cls)=>{
-   m.innerHTML=shw(title);const fh=A4CH-m.firstChild.offsetHeight-4,gap=19;
-   const st=`width:${A4CW}px;height:${fh}px;column-count:${cols};column-width:auto;column-gap:${gap}px;column-fill:auto`;
-   m.innerHTML=shw(`<div class="${cls}" style="${st}">${body}</div>`);
-   const fl=m.firstChild.firstChild,n=Math.max(1,Math.ceil((fl.scrollWidth+gap)/(A4CW+gap)-0.02));
-   if(n===1){pages.push(shw(`${title}<div class="${cls}" style="${st.replace('column-fill:auto','column-fill:balance').replace(/height:\d+px;/,'')}">${body}</div>`));return;}
-   for(let k=0;k<n;k++) pages.push(shw(`${title}<div style="position:relative;height:${fh}px;overflow:hidden"><div class="${cls}" style="position:absolute;top:0;left:${-k*(A4CW+gap)}px;${st}">${body}</div></div>`));
+  m.innerHTML=shw(P.p1);const h1=m.firstChild.offsetHeight,z=h1>A4CH?A4CH/h1:1;
+  const pe=m.querySelector('.por');
+  if(pe&&C.S.portrait){const r=pe.getBoundingClientRect(),b0=m.firstChild.getBoundingClientRect();
+   ov=[{src:C.S.portrait,x:A4M+(r.left-b0.left)*z,y:A4M+(r.top-b0.top)*z,w:r.width*z,h:r.height*z,py:parseFloat(PF[C.S.pfocus||'c'])/100}];}
+  pages.push({html:z<1?`<div style="zoom:${z.toFixed(4)}">${shw(P.p1)}</div>`:shw(P.p1),ov});
+  const flow=(title,body,ncol,cls)=>{
+   const fh=A4CH-hOf(title)-4,cw=(A4CW-gap*(ncol-1))/ncol;
+   const blocks=measureBlocks(cls,cw,body);
+   let cols=null;
+   if(ncol>1){const total=blocks.reduce((a,b)=>a+b.h,0);if(total<=fh*ncol){const t=packColumns(blocks,Math.max(total/ncol,...blocks.map(b=>b.h)));if(t.length<=ncol&&t.every(c=>c.h<=fh)) cols=t;}}
+   if(!cols) cols=packColumns(blocks,fh);
+   for(let k=0;k<cols.length;k+=ncol){const grp=cols.slice(k,k+ncol);
+    pages.push({html:shw(`${title}<div style="display:flex;align-items:flex-start;gap:${gap}px;height:${fh}px;overflow:hidden">${grp.map(c=>`<div class="${cls}" style="width:${cw}px;flex:none;columns:auto">${c.items.join('')}</div>`).join('')}</div>`)});}
   };
   flow(P.t2,P.f2,2,'ft flw');
   if(P.t3) flow(P.t3,P.top3+P.f3,1,'flw');
  } finally {m.remove();}
- const imgs=[];for(const p of pages) imgs.push(await pageJPEG(p,2.2));
+ const imgs=[];for(const p of pages) imgs.push(await pageJPEG(p.html,2.2,p.ov));
  return buildPdf(imgs,JSON.stringify(Object.assign({},C.S,{step:0})));
 }
 async function exportPDF(){
